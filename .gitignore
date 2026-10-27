@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+talentcore.db
+*.db
+.pytest_cache/
+.env
+venv/
+.venv/
+*_respaldo.txt
+*.zip
