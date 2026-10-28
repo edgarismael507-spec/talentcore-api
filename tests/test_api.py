@@ -1,3 +1,4 @@
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -5,342 +6,399 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.main import app, Base
-from app.models import get_db, Empleado, SolicitudVacaciones
+from app.models import get_db
 
-# Configuración de la base de datos de prueba en memoria
-SQLALCHEMY_DATABASE_URL = "sqlite://"
 
+# Base de datos temporal para las pruebas.
+# No modifica talentcore.db.
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
+    "sqlite://",
     connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
+    poolclass=StaticPool
 )
 
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+TestingSessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
 
-def override_get_db():
-    try:
-        db = TestingSessionLocal()
-        yield db
-    finally:
-        db.close()
-
-app.dependency_overrides[get_db] = override_get_db
-
-@pytest.fixture(autouse=True)
-def setup_database():
-    """
-    Crea las tablas antes de cada prueba y las elimina después.
-    Garantiza aislamiento entre pruebas.
-    """
-    Base.metadata.create_all(bind=engine)
-    yield
-    Base.metadata.drop_all(bind=engine)
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    Base.metadata.create_all(bind=engine)
 
-@pytest.fixture
-def admin_user(client):
-    """Crea un usuario ADMIN y devuelve su ID."""
-    response = client.post(
+    def override_get_db():
+        db = TestingSessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+
+    with TestClient(app) as test_client:
+        yield test_client
+
+    app.dependency_overrides.clear()
+    Base.metadata.drop_all(bind=engine)
+
+
+def crear_admin(client):
+    respuesta = client.post(
         "/api/v1/empleados",
         json={
-            "nombre": "Admin Test",
-            "rol": "ADMIN",
-            "saldo_vacaciones": 10
+            "nombre": "Administrador",
+            "email": "admin@talentcore.test",
+            "rol": "ADMIN_RRHH",
+            "anios_antiguedad": 1,
+            "manager_id": None
         }
     )
-    assert response.status_code == 201
-    return response.json()["id"]
+    assert respuesta.status_code == 201, respuesta.text
+    return respuesta.json()["id"]
 
-@pytest.fixture
-def regular_user(client):
-    """Crea un usuario EMPLEADO y devuelve su ID."""
-    response = client.post(
+
+def crear_manager(client, admin_id):
+    respuesta = client.post(
         "/api/v1/empleados",
+        headers={"X-User-Id": str(admin_id)},
         json={
-            "nombre": "Empleado Test",
+            "nombre": "Carlos Manager",
+            "email": "manager@talentcore.test",
+            "rol": "MANAGER",
+            "anios_antiguedad": 2,
+            "manager_id": None
+        }
+    )
+    assert respuesta.status_code == 201, respuesta.text
+    return respuesta.json()["id"]
+
+
+def crear_empleado(client, admin_id, manager_id):
+    respuesta = client.post(
+        "/api/v1/empleados",
+        headers={"X-User-Id": str(admin_id)},
+        json={
+            "nombre": "Pedro Empleado",
+            "email": "empleado@talentcore.test",
             "rol": "EMPLEADO",
-            "saldo_vacaciones": 5
+            "anios_antiguedad": 3,
+            "manager_id": manager_id
         }
     )
-    assert response.status_code == 201
-    return response.json()["id"]
+    assert respuesta.status_code == 201, respuesta.text
+    return respuesta.json()["id"]
 
-class TestHealthEndpoint:
-    def test_health_check(self, client):
-        response = client.get("/health")
-        assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
 
-class TestEmpleadoRegistration:
-    def test_register_employee_success(self, client):
-        response = client.post(
-            "/api/v1/empleados",
-            json={
-                "nombre": "Juan Perez",
-                "rol": "EMPLEADO",
-                "saldo_vacaciones": 15
-            }
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["nombre"] == "Juan Perez"
-        assert data["rol"] == "EMPLEADO"
-        assert data["saldo_vacaciones"] == 15
-        assert "id" in data
+def crear_equipo(client):
+    admin_id = crear_admin(client)
+    manager_id = crear_manager(client, admin_id)
+    empleado_id = crear_empleado(client, admin_id, manager_id)
+    return admin_id, manager_id, empleado_id
 
-    def test_register_admin_success(self, client):
-        response = client.post(
-            "/api/v1/empleados",
-            json={
-                "nombre": "Maria Lopez",
-                "rol": "ADMIN",
-                "saldo_vacaciones": 0
-            }
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["rol"] == "ADMIN"
 
-    def test_register_employee_invalid_rol(self, client):
-        response = client.post(
-            "/api/v1/empleados",
-            json={
-                "nombre": "Invalid Rol",
-                "rol": "SUPERVISOR",
-                "saldo_vacaciones": 10
-            }
-        )
-        assert response.status_code == 422
+def solicitar(client, empleado_id, dias=5):
+    return client.post(
+        "/api/v1/vacaciones/solicitar",
+        headers={"X-User-Id": str(empleado_id)},
+        json={
+            "empleado_id": empleado_id,
+            "dias_solicitados": dias,
+            "motivo": "Vacaciones familiares"
+        }
+    )
 
-    def test_register_employee_empty_name(self, client):
-        response = client.post(
-            "/api/v1/empleados",
-            json={
-                "nombre": "",
-                "rol": "EMPLEADO",
-                "saldo_vacaciones": 10
-            }
-        )
-        assert response.status_code == 422
 
-    def test_register_employee_negative_balance(self, client):
-        response = client.post(
-            "/api/v1/empleados",
-            json={
-                "nombre": "Negative Balance",
-                "rol": "EMPLEADO",
-                "saldo_vacaciones": -5
-            }
-        )
-        assert response.status_code == 422
+def revisar(client, manager_id, solicitud_id, accion):
+    return client.post(
+        f"/api/v1/vacaciones/{solicitud_id}/revisar",
+        headers={"X-User-Id": str(manager_id)},
+        json={"accion": accion}
+    )
 
-class TestConsultarSaldo:
-    def test_admin_can_check_any_balance(self, client, admin_user, regular_user):
-        response = client.get(
-            f"/api/v1/vacaciones/saldo/{regular_user}",
-            headers={"X-User-Id": str(admin_user)}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["empleado_id"] == regular_user
-        assert data["saldo_vacaciones"] == 5
 
-    def test_employee_can_check_own_balance(self, client, regular_user):
-        response = client.get(
-            f"/api/v1/vacaciones/saldo/{regular_user}",
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["empleado_id"] == regular_user
-        assert data["saldo_vacaciones"] == 5
+# =====================================
+# PRUEBAS DE SALUD
+# =====================================
 
-    def test_employee_cannot_check_other_balance(self, client, regular_user, admin_user):
-        # Intenta un empleado regular consultar el saldo de otro (aunque sea admin, la lógica es rol != ADMIN y id != empleado_id)
-        # En este caso, regular_user intenta consultar a admin_user
-        response = client.get(
-            f"/api/v1/vacaciones/saldo/{admin_user}",
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 403
-        assert response.json()["detail"] == "No puedes consultar el saldo de otro empleado"
+def test_health(client):
+    respuesta = client.get("/health")
+    assert respuesta.status_code == 200
+    assert respuesta.json() == {"status": "ok"}
 
-    def test_nonexistent_employee_balance(self, client, admin_user):
-        response = client.get(
-            "/api/v1/vacaciones/saldo/99999",
-            headers={"X-User-Id": str(admin_user)}
-        )
-        assert response.status_code == 404
-        assert response.json()["detail"] == "Empleado no encontrado"
 
-    def test_missing_header(self, client, regular_user):
-        response = client.get(f"/api/v1/vacaciones/saldo/{regular_user}")
-        assert response.status_code == 422
+# =====================================
+# PRUEBAS DE EMPLEADOS
+# =====================================
 
-class TestSolicitarVacaciones:
-    def test_employee_can_request_vacations(self, client, regular_user):
-        response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 3},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 201
-        data = response.json()
-        assert data["empleado_id"] == regular_user
-        assert data["dias_solicitados"] == 3
-        assert data["estado"] == "PENDIENTE"
+def test_crear_primer_administrador(client):
+    admin_id = crear_admin(client)
+    assert admin_id > 0
 
-    def test_admin_cannot_request_vacations(self, client, admin_user):
-        response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 3},
-            headers={"X-User-Id": str(admin_user)}
-        )
-        assert response.status_code == 403
-        assert response.json()["detail"] == "Solo los empleados pueden solicitar vacaciones"
 
-    def test_request_exceeds_balance(self, client, regular_user):
-        # Saldo es 5, solicita 6
-        response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 6},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Saldo de vacaciones insuficiente"
+def test_primer_usuario_debe_ser_admin(client):
+    respuesta = client.post(
+        "/api/v1/empleados",
+        json={
+            "nombre": "Usuario",
+            "email": "usuario@talentcore.test",
+            "rol": "EMPLEADO",
+            "anios_antiguedad": 1,
+            "manager_id": None
+        }
+    )
+    assert respuesta.status_code == 403
 
-    def test_request_exceeds_balance_with_pending(self, client, regular_user):
-        # Saldo es 5.
-        # Solicita 3 (PENDIENTE). Disponible: 5 - 3 = 2.
-        client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 3},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        # Intenta solicitar 3 más. Disponible: 2. 3 > 2 -> Error
-        response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 3},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 400
-        assert response.json()["detail"] == "Saldo de vacaciones insuficiente"
 
-    def test_request_zero_days(self, client, regular_user):
-        response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 0},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        assert response.status_code == 422
+def test_crear_manager(client):
+    admin_id = crear_admin(client)
+    manager_id = crear_manager(client, admin_id)
+    assert manager_id > 0
 
-class TestRevisarSolicitud:
-    def test_admin_can_approve_request(self, client, admin_user, regular_user):
-        # Crear solicitud
-        req_response = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 2},
-            headers={"X-User-Id": str(regular_user)}
-        )
-        solicitud_id = req_response.json()["id"]
 
-        # Aprobar
-        response = client.post(
-            f"/api/v1/vacaciones/{solicitud_id}/revisar",
-            json={"estado": "APROBADA"},
-           
-            headers={"X-User-Id": str(admin_user)}
-        )
+def test_crear_empleado_con_jefe(client):
+    _, _, empleado_id = crear_equipo(client)
+    assert empleado_id > 0
 
-        assert response.status_code == 200
-        assert response.json()["estado"] == "APROBADA"
 
-        # Comprobar que se descontaron los dias
-        saldo = client.get(
-            f"/api/v1/vacaciones/saldo/{regular_user}",
-            headers={"X-User-Id": str(regular_user)}
-        )
+def test_empleado_sin_jefe(client):
+    admin_id = crear_admin(client)
 
-        assert saldo.status_code == 200
-        assert saldo.json()["saldo_vacaciones"] == 3
+    respuesta = client.post(
+        "/api/v1/empleados",
+        headers={"X-User-Id": str(admin_id)},
+        json={
+            "nombre": "Sin Jefe",
+            "email": "sinjefe@talentcore.test",
+            "rol": "EMPLEADO",
+            "anios_antiguedad": 1,
+            "manager_id": None
+        }
+    )
+    assert respuesta.status_code == 400
 
-    def test_admin_can_reject_request(
-        self, client, admin_user, regular_user
-    ):
-        solicitud = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 2},
-            headers={"X-User-Id": str(regular_user)}
-        )
 
-        solicitud_id = solicitud.json()["id"]
+def test_correo_duplicado(client):
+    admin_id = crear_admin(client)
 
-        response = client.post(
-            f"/api/v1/vacaciones/{solicitud_id}/revisar",
-            json={"estado": "RECHAZADA"},
-            headers={"X-User-Id": str(admin_user)}
-        )
+    respuesta = client.post(
+        "/api/v1/empleados",
+        headers={"X-User-Id": str(admin_id)},
+        json={
+            "nombre": "Otro Administrador",
+            "email": "admin@talentcore.test",
+            "rol": "ADMIN_RRHH",
+            "anios_antiguedad": 1,
+            "manager_id": None
+        }
+    )
+    assert respuesta.status_code == 400
 
-        assert response.status_code == 200
-        assert response.json()["estado"] == "RECHAZADA"
 
-        # Rechazar no debe descontar dias
-        saldo = client.get(
-            f"/api/v1/vacaciones/saldo/{regular_user}",
-            headers={"X-User-Id": str(regular_user)}
-        )
+def test_rol_invalido(client):
+    respuesta = client.post(
+        "/api/v1/empleados",
+        json={
+            "nombre": "Usuario",
+            "email": "invalido@talentcore.test",
+            "rol": "SUPERVISOR",
+            "anios_antiguedad": 1,
+            "manager_id": None
+        }
+    )
+    assert respuesta.status_code == 422
 
-        assert saldo.json()["saldo_vacaciones"] == 5
 
-    def test_employee_cannot_approve(
-        self, client, regular_user
-    ):
-        solicitud = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 2},
-            headers={"X-User-Id": str(regular_user)}
-        )
+# =====================================
+# PRUEBAS DE SALDO
+# =====================================
 
-        solicitud_id = solicitud.json()["id"]
+def test_saldo_inicial(client):
+    _, _, empleado_id = crear_equipo(client)
 
-        response = client.post(
-            f"/api/v1/vacaciones/{solicitud_id}/revisar",
-            json={"estado": "APROBADA"},
-            headers={"X-User-Id": str(regular_user)}
-        )
+    respuesta = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}",
+        headers={"X-User-Id": str(empleado_id)}
+    )
 
-        assert response.status_code == 403
+    assert respuesta.status_code == 200
+    assert respuesta.json()["dias_totales"] == 16
+    assert respuesta.json()["saldo_disponible"] == 16
 
-    def test_cannot_review_twice(
-        self, client, admin_user, regular_user
-    ):
-        solicitud = client.post(
-            "/api/v1/vacaciones/solicitar",
-            json={"dias_solicitados": 2},
-            headers={"X-User-Id": str(regular_user)}
-        )
 
-        solicitud_id = solicitud.json()["id"]
+def test_admin_consulta_saldo(client):
+    admin_id, _, empleado_id = crear_equipo(client)
 
-        url = f"/api/v1/vacaciones/{solicitud_id}/revisar"
-        headers = {"X-User-Id": str(admin_user)}
+    respuesta = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}",
+        headers={"X-User-Id": str(admin_id)}
+    )
+    assert respuesta.status_code == 200
 
-        primera = client.post(
-            url,
-            json={"estado": "APROBADA"},
-            headers=headers
-        )
 
-        assert primera.status_code == 200
+def test_manager_consulta_saldo(client):
+    _, manager_id, empleado_id = crear_equipo(client)
 
-        segunda = client.post(
-            url,
-            json={"estado": "RECHAZADA"},
-            headers=headers
-        )
+    respuesta = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}",
+        headers={"X-User-Id": str(manager_id)}
+    )
+    assert respuesta.status_code == 200
 
-        assert segunda.status_code == 400
+
+def test_saldo_sin_header(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    respuesta = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}"
+    )
+    assert respuesta.status_code == 422
+
+
+def test_saldo_empleado_inexistente(client):
+    admin_id = crear_admin(client)
+
+    respuesta = client.get(
+        "/api/v1/vacaciones/saldo/99999",
+        headers={"X-User-Id": str(admin_id)}
+    )
+    assert respuesta.status_code == 404
+
+
+# =====================================
+# PRUEBAS DE SOLICITUDES
+# =====================================
+
+def test_solicitar_vacaciones(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    respuesta = solicitar(client, empleado_id, 5)
+
+    assert respuesta.status_code == 201
+    assert respuesta.json()["estado"] == "PENDING"
+    assert respuesta.json()["dias_solicitados"] == 5
+
+
+def test_solicitud_excesiva(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    respuesta = solicitar(client, empleado_id, 20)
+    assert respuesta.status_code == 400
+
+
+def test_solicitud_dias_cero(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    respuesta = solicitar(client, empleado_id, 0)
+    assert respuesta.status_code == 422
+
+
+def test_solicitud_para_otro_empleado(client):
+    admin_id, _, empleado_id = crear_equipo(client)
+
+    respuesta = client.post(
+        "/api/v1/vacaciones/solicitar",
+        headers={"X-User-Id": str(empleado_id)},
+        json={
+            "empleado_id": admin_id,
+            "dias_solicitados": 2,
+            "motivo": "Vacaciones"
+        }
+    )
+    assert respuesta.status_code == 403
+
+
+def test_solicitudes_pendientes_restan_disponibilidad(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    primera = solicitar(client, empleado_id, 10)
+    segunda = solicitar(client, empleado_id, 7)
+
+    assert primera.status_code == 201
+    assert segunda.status_code == 400
+
+
+# =====================================
+# PRUEBAS DE APROBACION
+# =====================================
+
+def test_manager_aprueba(client):
+    _, manager_id, empleado_id = crear_equipo(client)
+
+    solicitud = solicitar(client, empleado_id, 5)
+    assert solicitud.status_code == 201
+
+    respuesta = revisar(
+        client, manager_id, solicitud.json()["id"], "APPROVE"
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["estado"] == "APPROVED"
+
+    saldo = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}",
+        headers={"X-User-Id": str(empleado_id)}
+    )
+    assert saldo.json()["saldo_disponible"] == 11
+
+
+def test_manager_rechaza(client):
+    _, manager_id, empleado_id = crear_equipo(client)
+
+    solicitud = solicitar(client, empleado_id, 5)
+
+    respuesta = revisar(
+        client, manager_id, solicitud.json()["id"], "REJECT"
+    )
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["estado"] == "REJECTED"
+
+    saldo = client.get(
+        f"/api/v1/vacaciones/saldo/{empleado_id}",
+        headers={"X-User-Id": str(empleado_id)}
+    )
+    assert saldo.json()["saldo_disponible"] == 16
+
+
+def test_empleado_no_puede_aprobar(client):
+    _, _, empleado_id = crear_equipo(client)
+
+    solicitud = solicitar(client, empleado_id, 2)
+
+    respuesta = revisar(
+        client, empleado_id, solicitud.json()["id"], "APPROVE"
+    )
+    assert respuesta.status_code == 403
+
+
+def test_admin_no_es_jefe_directo(client):
+    admin_id, _, empleado_id = crear_equipo(client)
+
+    solicitud = solicitar(client, empleado_id, 2)
+
+    respuesta = revisar(
+        client, admin_id, solicitud.json()["id"], "APPROVE"
+    )
+    assert respuesta.status_code == 403
+
+
+def test_no_revisar_dos_veces(client):
+    _, manager_id, empleado_id = crear_equipo(client)
+
+    solicitud = solicitar(client, empleado_id, 2)
+    solicitud_id = solicitud.json()["id"]
+
+    primera = revisar(client, manager_id, solicitud_id, "APPROVE")
+    segunda = revisar(client, manager_id, solicitud_id, "REJECT")
+
+    assert primera.status_code == 200
+    assert segunda.status_code == 400
+
+
+def test_solicitud_inexistente(client):
+    _, manager_id, _ = crear_equipo(client)
+
+    respuesta = revisar(client, manager_id, 99999, "APPROVE")
+    assert respuesta.status_code == 404
